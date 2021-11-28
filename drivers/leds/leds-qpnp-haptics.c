@@ -359,10 +359,31 @@ struct hap_chip {
 	bool				play_irq_en;
 	bool				auto_res_err_recovery_hw;
 	bool				vcc_pon_enabled;
-	int				vmax_override;
+#ifdef CONFIG_TSPDRV
+	u16					tsp_amp;
+#endif
 };
 
-struct hap_chip *gchip;
+#ifdef CONFIG_TSPDRV
+static u8 rb_pattern[] = {
+	0x00, /* 0 ~ 9 */
+	0x02, /* 10 ~ 19 */
+	0x03, /* 20 ~ 29 */
+	0x07, /* 30 ~ 39 */
+	0x07, /* 40 ~ 49 */
+	0x0b, /* 50 ~ 59 */
+	0x7f, /* 60 ~ 69 */
+	0x7f, /* 70 ~ 79 */
+	0xbf, /* 80 ~ 89 */
+	0xbf, /* 90 ~ 99*/
+	0xff, /* 100 ~ 109 */
+	0xff, /* 110 ~ 119 */
+	0xff, /* 120 ~ 126 */
+	0xff, /* 127 */
+};
+#define RB_PATTERN_MAX 14
+bool elt_state;
+#endif
 
 static int qpnp_haptics_parse_buffer_dt(struct hap_chip *chip);
 static int qpnp_haptics_parse_pwm_dt(struct hap_chip *chip);
@@ -775,6 +796,12 @@ static int qpnp_haptics_play(struct hap_chip *chip, bool enable)
 				ktime_set(0, AUTO_RES_ERR_POLL_TIME_NS),
 				HRTIMER_MODE_REL);
 	} else {
+#ifdef CONFIG_TSPDRV
+		if (chip->play_mode == HAP_DIRECT) {
+			chip->vmax_mv = HAP_VMAX_MAX_MV;
+			qpnp_haptics_vmax_config(chip, chip->vmax_mv, false);
+		}
+#endif
 		rc = qpnp_haptics_play_control(chip, HAP_STOP);
 		if (rc < 0) {
 			pr_err("Error in disabling play, rc=%d\n", rc);
@@ -1334,34 +1361,6 @@ static int qpnp_haptics_auto_mode_config(struct hap_chip *chip, int time_ms)
 	return 0;
 }
 
-void set_vibrate(int val)
-{
-	int rc;
-
-	if (val > gchip->max_play_time_ms)
-		return;
-
-	mutex_lock(&gchip->param_lock);
-	rc = qpnp_haptics_auto_mode_config(gchip, val);
-	if (rc < 0) {
-		pr_err("Unable to do auto mode config\n");
-		mutex_unlock(&gchip->param_lock);
-		return;
-	}
-
-	gchip->play_time_ms = val;
-	mutex_unlock(&gchip->param_lock);
-
-	hrtimer_cancel(&gchip->stop_timer);
-	if (is_sw_lra_auto_resonance_control(gchip))
-		hrtimer_cancel(&gchip->auto_res_err_poll_timer);
-	cancel_work_sync(&gchip->haptics_work);
-
-	atomic_set(&gchip->state, 1);
-	schedule_work(&gchip->haptics_work);
-
-}
-
 static irqreturn_t qpnp_haptics_play_irq_handler(int irq, void *data)
 {
 	struct hap_chip *chip = data;
@@ -1550,9 +1549,6 @@ static ssize_t qpnp_haptics_store_activate(struct device *dev,
 		return rc;
 
 	if (val != 0 && val != 1)
-		return count;
-
-	if (chip->vmax_mv <= HAP_VMAX_MIN_MV && (val != 0))
 		return count;
 
 	if (val) {
@@ -1795,9 +1791,6 @@ static ssize_t qpnp_haptics_store_vmax(struct device *dev,
 	if (rc < 0)
 		return rc;
 
-	if (chip->vmax_override)
-		return count;
-
 	old_vmax_mv = chip->vmax_mv;
 	chip->vmax_mv = data;
 	rc = qpnp_haptics_vmax_config(chip, chip->vmax_mv, false);
@@ -1805,65 +1798,6 @@ static ssize_t qpnp_haptics_store_vmax(struct device *dev,
 		chip->vmax_mv = old_vmax_mv;
 		return rc;
 	}
-
-	return count;
-}
-
-static ssize_t qpnp_haptics_show_vmax_mv_user(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct led_classdev *cdev = dev_get_drvdata(dev);
-	struct hap_chip *chip = container_of(cdev, struct hap_chip, cdev);
-
-	return snprintf(buf, PAGE_SIZE, "%d\n", chip->vmax_mv);
-}
-
-static ssize_t qpnp_haptics_store_vmax_mv_user(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct led_classdev *cdev = dev_get_drvdata(dev);
-	struct hap_chip *chip = container_of(cdev, struct hap_chip, cdev);
-	int data, rc, old_vmax_mv;
-
-	rc = kstrtoint(buf, 10, &data);
-	if (rc < 0)
-		return rc;
-
-	old_vmax_mv = chip->vmax_mv;
-	chip->vmax_mv = data;
-	rc = qpnp_haptics_vmax_config(chip, chip->vmax_mv, false);
-	if (rc < 0) {
-		chip->vmax_mv = old_vmax_mv;
-		return rc;
-	}
-
-	return count;
-}
-
-static ssize_t qpnp_haptics_show_vmax_override(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct led_classdev *cdev = dev_get_drvdata(dev);
-	struct hap_chip *chip = container_of(cdev, struct hap_chip, cdev);
-
-	return snprintf(buf, PAGE_SIZE, "%d\n", chip->vmax_override);
-}
-
-static ssize_t qpnp_haptics_store_vmax_override(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct led_classdev *cdev = dev_get_drvdata(dev);
-	struct hap_chip *chip = container_of(cdev, struct hap_chip, cdev);
-	int data, rc;
-
-	rc = kstrtoint(buf, 10, &data);
-	if (rc < 0)
-		return rc;
-
-	if (data != 0 && data != 1)
-		return count;
-
-	chip->vmax_override = !!data;
 
 	return count;
 }
@@ -1895,6 +1829,83 @@ static ssize_t qpnp_haptics_store_lra_auto_mode(struct device *dev,
 	return count;
 }
 
+#ifdef CONFIG_TSPDRV
+/* sysfs show for amp */
+static ssize_t qpnp_haptics_show_amp(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct hap_chip *chip = container_of(cdev, struct hap_chip, cdev);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", chip->tsp_amp);
+}
+
+/* sysfs store for amp */
+static ssize_t qpnp_haptics_store_amp(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	struct hap_chip *chip = container_of(cdev, struct hap_chip, cdev);
+	int value, amp_index, rc = 0;
+	u8 rb_reg;
+
+	if (sscanf(buf, "%d", &value) != 1)
+		return -EINVAL;
+
+	if (value == 127) {
+		amp_index = RB_PATTERN_MAX - 1;
+	} else {
+		amp_index = value/10;
+	}
+	if (amp_index <  RB_PATTERN_MAX)
+		rc = qpnp_haptics_write_reg(chip, HAP_BRAKE_REG(chip),
+				&rb_pattern[amp_index], 1);
+
+	if (rc) {
+		dev_err(&chip->pdev->dev,
+				"Error while writing BRAKE register\n");
+		return rc;
+	}
+
+	chip->tsp_amp = value;
+
+	rc = qpnp_haptics_read_reg(chip, HAP_BRAKE_REG(chip),
+				&rb_reg, 1);
+
+	if (rc) {
+		dev_err(&chip->pdev->dev,
+				"Error while reading BRAKE register\n");
+		return rc;
+	}
+
+	dev_info(&chip->pdev->dev, "%s: value : %d, amp_index : %d, rb_reg : %d\n",
+				__func__, value, amp_index, rb_reg);
+
+	return count;
+}
+static ssize_t qpnp_haptics_show_elt(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%d\n", elt_state);
+}
+
+/* sysfs store for elt */
+static ssize_t qpnp_haptics_store_elt(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	int value;
+	if (sscanf(buf, "%d", &value) != 1)
+		return 0;
+
+	if (value == 1){
+		elt_state = 1;
+	} else {
+		elt_state = 0;
+	}
+	return count;
+}
+#endif
+
 static struct device_attribute qpnp_haptics_attrs[] = {
 	__ATTR(state, 0664, qpnp_haptics_show_state, qpnp_haptics_store_state),
 	__ATTR(duration, 0664, qpnp_haptics_show_duration,
@@ -1910,10 +1921,12 @@ static struct device_attribute qpnp_haptics_attrs[] = {
 	__ATTR(wf_s_rep_count, 0664, qpnp_haptics_show_wf_s_rep_count,
 		qpnp_haptics_store_wf_s_rep_count),
 	__ATTR(vmax_mv, 0664, qpnp_haptics_show_vmax, qpnp_haptics_store_vmax),
-	__ATTR(vmax_override, 0664, qpnp_haptics_show_vmax_override, qpnp_haptics_store_vmax_override),
-	__ATTR(vmax_mv_user, 0664, qpnp_haptics_show_vmax_mv_user, qpnp_haptics_store_vmax_mv_user),
 	__ATTR(lra_auto_mode, 0664, qpnp_haptics_show_lra_auto_mode,
 		qpnp_haptics_store_lra_auto_mode),
+#ifdef CONFIG_TSPDRV
+	__ATTR(amp, 0664, qpnp_haptics_show_amp, qpnp_haptics_store_amp),
+	__ATTR(elt, 0664, qpnp_haptics_show_elt, qpnp_haptics_store_elt),
+#endif
 };
 
 /* Dummy functions for brightness */
@@ -2578,8 +2591,6 @@ static int qpnp_haptics_probe(struct platform_device *pdev)
 			goto sysfs_fail;
 		}
 	}
-
-	gchip = chip;
 
 	return 0;
 
